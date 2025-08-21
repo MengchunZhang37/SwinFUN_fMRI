@@ -17,7 +17,7 @@ SwiFUN_clean/
   ├─ sample_scripts/        # Only for 3D Swin Transformer
   └─ reproduce.ipynb        # Reproducible pipeline entry point
 cleaned_data/               # Sample data directory layout (DS000030-based)
-
+```
 
 
 ## How to Run
@@ -26,7 +26,7 @@ cleaned_data/               # Sample data directory layout (DS000030-based)
 ```bash
 cd SwiFUN_clean/env
 sbatch build_env.sh
-
+```
 This job creates the Conda environment defined by py39.yaml and installs packages from requirements.txt.
 When it finishes, activate the environment as printed in the job output (e.g., conda activate py39).
 If you need a Jupyter kernel locally:
@@ -34,7 +34,7 @@ If you need a Jupyter kernel locally:
 ```bash
 pip install ipykernel
 python -m ipykernel install --user --name py39 --display-name "Python (py39)"
-
+```
 
 ### 2. Prepare data
 Follow the layout shown in cleaned_data/ (DS000030-based), or update paths in the notebook accordingly.
@@ -42,6 +42,6 @@ Follow the layout shown in cleaned_data/ (DS000030-based), or update paths in th
 ### 3. Run the pipeline
 ```bash
 SwiFUN_clean/reproduce.ipynb
-
+```
 
 
