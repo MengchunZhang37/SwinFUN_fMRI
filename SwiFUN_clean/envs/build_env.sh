@@ -11,7 +11,7 @@ conda env remove -n py39 -y
 
 conda env create -f /ihome/haizenstein/mez141/ondemand/py39.yaml
 
-source activate py39  # 有些系统需要 conda activate py39
+source activate py39  # some system may need to use: conda activate py39
 
 pip install --no-cache-dir --user -r /ihome/haizenstein/mez141/ondemand/requirements.txt
 
