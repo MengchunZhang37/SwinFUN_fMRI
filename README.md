@@ -40,10 +40,11 @@ python -m ipykernel install --user --name py39 --display-name "Python (py39)"
 ### 2. Prepare data
 Follow the layout shown in cleaned_data/ (DS000030-based), or update paths in the notebook accordingly.
 
-TL;DR
-a)Run fMRIPrep with default settings
-b)Run minimal preprocessing: python preprocessing_fMRIprep.py
-
+```bash
+# a)Run fMRIPrep with default settings
+# b)Run minimal preprocessing: 
+python preprocessing_fMRIprep.py
+```
 
 ### 3. Run the pipeline
 ```bash
