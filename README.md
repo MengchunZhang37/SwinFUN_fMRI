@@ -3,6 +3,7 @@
 This repository contains:
 - **`SwiFUN_original/`** — Original implementation used by the literature ([paper](https://direct.mit.edu/imag/article/doi/10.1162/imag_a_00440/126557/Predicting-task-related-brain-activity-from), [GitHub](https://github.com/Transconnectome/SwiFUN)).
 - **`SwiFUN_clean/`** — Debugged & cleaned implementation (recommended for running).
+- **`SwiFUN_rsfMRI/`** — Modified from SwiFUN_clean → rsfMRI autoencoder for future-token prediction.
 - **`cleaned_data/`** — Sample **data-preparation structure** based on the open-source dataset **DS000030** (layout reference only).
 
 ## Repository Layout
