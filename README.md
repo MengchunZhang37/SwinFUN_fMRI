@@ -3,6 +3,7 @@
 This repository contains:
 - **`SwiFUN_original/`** — Original implementation used by the literature ([paper](https://direct.mit.edu/imag/article/doi/10.1162/imag_a_00440/126557/Predicting-task-related-brain-activity-from), [GitHub](https://github.com/Transconnectome/SwiFUN)).
 - **`SwiFUN_clean/`** — Debugged & cleaned implementation (recommended for running).
+- **`SwiFUN_rsfMRI/`** — Modified from SwiFUN_clean → rsfMRI autoencoder for future-token prediction.
 - **`cleaned_data/`** — Sample **data-preparation structure** based on the open-source dataset **DS000030** (layout reference only).
 
 ## Repository Layout
@@ -16,6 +17,7 @@ SwiFUN_clean/
   ├─ project/               # All Python code
   ├─ sample_scripts/        # Only for 3D Swin Transformer
   └─ reproduce.ipynb        # Reproducible pipeline entry point
+SwiFUN_rsfMRI/              # Modified to rsfMRI autoencoder
 cleaned_data/               # Sample data directory layout (DS000030-based)
 ```
 
@@ -39,9 +41,15 @@ python -m ipykernel install --user --name py39 --display-name "Python (py39)"
 ### 2. Prepare data
 Follow the layout shown in cleaned_data/ (DS000030-based), or update paths in the notebook accordingly.
 
+```bash
+# a)Run fMRIPrep with default settings
+# b)Run minimal preprocessing: 
+python preprocessing_fMRIprep.py
+```
+
 ### 3. Run the pipeline
 ```bash
-SwiFUN_clean/reproduce.ipynb
+SwiFUN_rsfMRI/reproduce.ipynb
 ```
 
 
