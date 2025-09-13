@@ -16,6 +16,7 @@ SwiFUN_clean/
   ├─ project/               # All Python code
   ├─ sample_scripts/        # Only for 3D Swin Transformer
   └─ reproduce.ipynb        # Reproducible pipeline entry point
+SwiFUN_rsfMRI/              # modified to rsfMRI autoencoder
 cleaned_data/               # Sample data directory layout (DS000030-based)
 ```
 
