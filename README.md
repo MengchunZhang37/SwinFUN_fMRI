@@ -16,7 +16,7 @@ SwiFUN_clean/
   ├─ project/               # All Python code
   ├─ sample_scripts/        # Only for 3D Swin Transformer
   └─ reproduce.ipynb        # Reproducible pipeline entry point
-SwiFUN_rsfMRI/              # modified to rsfMRI autoencoder
+SwiFUN_rsfMRI/              # Modified to rsfMRI autoencoder
 cleaned_data/               # Sample data directory layout (DS000030-based)
 ```
 
@@ -40,9 +40,14 @@ python -m ipykernel install --user --name py39 --display-name "Python (py39)"
 ### 2. Prepare data
 Follow the layout shown in cleaned_data/ (DS000030-based), or update paths in the notebook accordingly.
 
+TL;DR
+a)Run fMRIPrep with default settings
+b)Run minimal preprocessing: python preprocessing_fMRIprep.py
+
+
 ### 3. Run the pipeline
 ```bash
-SwiFUN_clean/reproduce.ipynb
+SwiFUN_rsfMRI/reproduce.ipynb
 ```
 
 
