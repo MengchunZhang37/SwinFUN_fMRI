@@ -323,11 +323,18 @@ class LitClassifier(pl.LightningModule):
                 gt_next   = gt_next   * m
             
             # Compute mse@k / r@k
-            pred_f = pred_next.flatten(start_dim=1)
-            gt_f   = gt_next.flatten(start_dim=1)
-            mse_k  = F.mse_loss(pred_f, gt_f)
+            # MSE@k (average only within brain region)
+            m6 = self.MNI152_mask[None, None, ...].unsqueeze(-1).float()\
+                    .to(pred_next.device).expand_as(pred_next)          # [B,1,96,96,96,1]
+            se = (pred_next - gt_next).pow(2)
+            mse_k = (se * m6).sum() / m6.sum().clamp_min(1.0)
 
-            # r@k (overall Pearson after flattening)
+            # r@k: Pearson correlation along spatial dimensions (only within brain region)
+            pred_sp = pred_next.squeeze(1).squeeze(-1)                  # [B,96,96,96]
+            gt_sp   = gt_next.squeeze(1).squeeze(-1)                    # [B,96,96,96]
+            mask_flat = self.MNI152_mask.view(-1).bool()
+            pred_f = pred_sp.view(B, -1)[:, mask_flat]                  # [B, V_mask]
+            gt_f   = gt_sp.view(B, -1)[:, mask_flat]                    # [B, V_mask]
             x = pred_f - pred_f.mean(dim=1, keepdim=True)
             y = gt_f   - gt_f.mean(dim=1, keepdim=True)
             r_k = (x * y).sum(dim=1) / (x.norm(dim=1) * y.norm(dim=1) + 1e-6)
@@ -340,16 +347,27 @@ class LitClassifier(pl.LightningModule):
             ctx = torch.cat([ctx[..., 1:], pred_next], dim=-1)
 
     @staticmethod
-    def _r_time_mean(x, y):
-        """Mean Pearson correlation along the time dimension;
-        supports inputs of shape [B,1,D,H,W,T] or [B,V,T]"""
-        if x.ndim == 6:  # reshape to [B,V,T]
-            x = x.view(x.shape[0], -1, x.shape[-1])
-        if y.ndim == 6:
-            y = y.view(y.shape[0], -1, y.shape[-1])
-        xz = (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + 1e-6)
-        yz = (y - y.mean(-1, keepdim=True)) / (y.std(-1, keepdim=True) + 1e-6)
-        return (xz * yz).mean()
+    def _r_time_mean(x, y, mask=None):
+        """Mean Pearson correlation along time; supports [B,1,D,H,W,T] or [B,V,T].
+           If mask is provided (96x96x96 bool), only voxels inside mask are used.
+        """
+        def to_BVT(t):
+            if t.ndim == 6:
+                return t.view(t.shape[0], -1, t.shape[-1])
+            if t.ndim == 3:
+                return t
+            raise AssertionError(f"expect [B,1,D,H,W,T] or [B,V,T], got {tuple(t.shape)}")
+
+        X = to_BVT(x)
+        Y = to_BVT(y)
+        if mask is not None:
+            m = mask.view(-1).bool()
+            X = X[:, m, :]
+            Y = Y[:, m, :]
+
+        Xz = (X - X.mean(-1, keepdim=True)) / (X.std(-1, keepdim=True) + 1e-6)
+        Yz = (Y - Y.mean(-1, keepdim=True)) / (Y.std(-1, keepdim=True) + 1e-6)
+        return (Xz * Yz).mean()
     
     @torch.no_grad()
     def _log_rfMRI_baselines(self, batch, mode="valid"):
@@ -393,31 +411,46 @@ class LitClassifier(pl.LightningModule):
 
 
         # Apply mask if available
-        if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
-            m = self.MNI152_mask[None, None, ...].bool().unsqueeze(-1).expand_as(y_future)
-            y_future     = y_future.masked_fill(~m, 0.0)
-            base_persist = base_persist.masked_fill(~m, 0.0)
-            base_mean    = base_mean.masked_fill(~m, 0.0)
+        if not hasattr(self, "MNI152_mask") or self.MNI152_mask is None:
+            return  
 
-        # Errors
-        yf = y_future.flatten(start_dim=1)
-        pf = base_persist.flatten(start_dim=1)
-        mf = base_mean.flatten(start_dim=1)
-        mse_p, mae_p = F.mse_loss(pf, yf), F.l1_loss(pf, yf)
-        mse_m, mae_m = F.mse_loss(mf, yf), F.l1_loss(mf, yf)
+        m6 = self.MNI152_mask[None, None, ...].unsqueeze(-1).float().to(y_future.device).expand_as(y_future)  # [B,1,96,96,96,T_hz]
 
-        # r_time (using the helper function)
-        r_p = self._r_time_mean(base_persist, y_future)
-        r_m = self._r_time_mean(base_mean,    y_future)
+        def mse_mask(a, b):
+            se = (a - b).pow(2) * m6
+            return se.sum() / m6.sum().clamp_min(1.0)
 
-        # Log metrics
+        def mae_mask(a, b):
+            ae = (a - b).abs() * m6
+            return ae.sum() / m6.sum().clamp_min(1.0)
+
+        mse_p = mse_mask(base_persist, y_future)
+        mae_p = mae_mask(base_persist, y_future)
+        mse_m = mse_mask(base_mean,    y_future)
+        mae_m = mae_mask(base_mean,    y_future)
+
+        r_p = self._r_time_mean(base_persist, y_future, mask=self.MNI152_mask)
+        r_m = self._r_time_mean(base_mean,    y_future, mask=self.MNI152_mask)
+        
+        #check
+        with torch.no_grad():
+            y_std = torch.sqrt(((y_future**2) * m6).sum() / m6.sum().clamp_min(1.0))
+            rmse_p = torch.sqrt(((base_persist - y_future).pow(2) * m6).sum() / m6.sum().clamp_min(1.0))
+            rel_rmse_p = rmse_p / (y_std + 1e-8)
+            rel_rmse_expected = torch.sqrt(torch.clamp(2 * (1.0 - r_p), min=0.0))
+        self.log(f"{mode}_y_std_mask", y_std, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_rmse_baseline_persist", rmse_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_relrmse_persist", rel_rmse_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_relrmse_expected_from_rho1", rel_rmse_expected, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+
         self.log(f"{mode}_mse_baseline_persist", mse_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
         self.log(f"{mode}_mae_baseline_persist", mae_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
         self.log(f"{mode}_r_time_baseline_persist", r_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
 
-        self.log(f"{mode}_mse_baseline_ctxmean", mse_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
-        self.log(f"{mode}_mae_baseline_ctxmean", mae_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_mse_baseline_ctxmean",  mse_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_mae_baseline_ctxmean",  mae_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
         self.log(f"{mode}_r_time_baseline_ctxmean", r_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_mask_fraction", self.MNI152_mask.float().mean(), on_step=False, on_epoch=True)
 
     def _tf_ratio(self):
         if not self.training:
@@ -531,30 +564,57 @@ class LitClassifier(pl.LightningModule):
             # [B,1,96,96,96,T] -> [B, V*T]
             logits_f = logits.flatten(start_dim=1)
             target_f = target.flatten(start_dim=1)
+            
+            if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                m6 = (
+                    self.MNI152_mask[None, None, ...]
+                    .unsqueeze(-1)
+                    .float()
+                    .to(logits.device)
+                    .expand_as(logits)
+                )  # [B,1,96,96,96,T]
+            else:
+                m6 = torch.ones_like(logits, dtype=torch.float32)
 
             if self.hparams.loss_type == "mae":
-                loss = F.l1_loss(logits_f, target_f)
+                # MAE averaged within the mask
+                loss = ((logits - target).abs() * m6).sum() / m6.sum().clamp_min(1.0)
+                within_subj_loss = loss
+                across_subj_loss = torch.zeros(1, device=logits.device)
             elif self.hparams.loss_type == "rc":
-                within_subj_loss, across_subj_loss = contrast_mse_loss(logits_f, target_f, subj)
+                # Apply mask and then flatten (keep only brain-region voxels)
+                B, _, _, _, _, T = logits.shape
+                if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                    mask_flat = self.MNI152_mask.view(-1).bool()
+                    L   = logits.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                    Tgt = target.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                else:
+                    L   = logits.flatten(start_dim=1)
+                    Tgt = target.flatten(start_dim=1)
+                within_subj_loss, across_subj_loss = contrast_mse_loss(L, Tgt, subj)
                 loss = (
                     self.hparams.within_subj_margin * within_subj_loss
                     - self.hparams.across_subj_margin * across_subj_loss
                 )
-            else:  # default MSE
-                loss = F.mse_loss(logits_f, target_f)
+            else:  # MSE averaged within the mask
+                loss = ((logits - target).pow(2) * m6).sum() / m6.sum().clamp_min(1.0)
+                within_subj_loss = loss
+                across_subj_loss = torch.zeros(1, device=logits.device)
+
 
             # Log r (temporal correlation): treat [B,1,96,96,96,T] as [B, V, T]
             with torch.no_grad():
-                L   = logits.view(logits.shape[0], -1, logits.shape[-1])
-                Tgt = target.view(target.shape[0],  -1, target.shape[-1])
-                Lz   = (L   - L.mean(-1, keepdim=True)) / (L.std(-1, keepdim=True) + 1e-6)
-                Tgtz = (Tgt - Tgt.mean(-1, keepdim=True)) / (Tgt.std(-1, keepdim=True) + 1e-6)
-                r_time_mean = (Lz * Tgtz).mean()
+                if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                    r_time_mean = self._r_time_mean(logits, target, mask=self.MNI152_mask)
+                else:
+                    r_time_mean = self._r_time_mean(logits, target)
+                mse_val = ((logits - target).pow(2) * m6).sum() / m6.sum().clamp_min(1.0)
+                l1_val  = ((logits - target).abs()   * m6).sum() / m6.sum().clamp_min(1.0)
 
             result_dict = {
                 f"{mode}_loss": loss,
-                f"{mode}_mse": F.mse_loss(logits_f, target_f),
-                f"{mode}_l1_loss": F.l1_loss(logits_f, target_f),
+                f"{mode}_mse": mse_val,
+                f"{mode}_l1_loss": l1_val,
                 f"{mode}_r_time_mean": r_time_mean,
             }
             self.log_dict(
@@ -565,6 +625,15 @@ class LitClassifier(pl.LightningModule):
 
         #=== tfMRI ===
         if 'tfMRI' in self.hparams.downstream_task:
+            B = logits.shape[0]
+            if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                mask_flat = self.MNI152_mask.view(-1).bool()
+                logits = logits.view(B, -1)[:, mask_flat]
+                target = target.view(B, -1)[:, mask_flat]
+            else:
+                logits = logits.flatten(start_dim=1)
+                target = target.flatten(start_dim=1)
+                
             if self.hparams.loss_type == 'mse':
                 logits = logits.flatten(start_dim=1) # (batch,mask_dim)
                 target = target.flatten(start_dim=1) # (batch,mask_dim)
@@ -763,9 +832,17 @@ class LitClassifier(pl.LightningModule):
             return (subj, output.detach().cpu())
         elif task == 'rfMRI_next':
             subj, logits, target = self._compute_logits(batch)              # logits/target: [B,1,96,96,96,T]
-            logits_f = logits.flatten(start_dim=1)                          # [B, V*T]
-            target_f = target.flatten(start_dim=1)                          # [B, V*T]
-            output = torch.stack([logits_f, target_f], dim=2)               # [B, V*T, 2]
+            B, _, _, _, _, T = logits.shape
+            if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                mask_flat = self.MNI152_mask.view(-1).bool().to(logits.device)  # [V]
+                # [B, V, T] → select masked voxels → [B, Vmask, T] → reshape to [B, Vmask*T]
+                logits_f = logits.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                target_f = target.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+            else:
+                logits_f = logits.flatten(start_dim=1)
+                target_f = target.flatten(start_dim=1)
+            output = torch.stack([logits_f, target_f], dim=2)  # [B, Vmask*T or V*T, 2]
+
 
             # Perform rollout curves only on the first validation dataloader to avoid duplicate logging
             if dataloader_idx == 0:
@@ -959,9 +1036,16 @@ class LitClassifier(pl.LightningModule):
             return (subj, output)
         elif task == 'rfMRI_next':
             subj, logits, target = self._compute_logits(batch)              # logits/target: [B,1,96,96,96,T]
-            logits_f = logits.flatten(start_dim=1)                          # [B, V*T]
-            target_f = target.flatten(start_dim=1)                          # [B, V*T]
-            output = torch.stack([logits_f, target_f], dim=2)               # [B, V*T, 2]
+            B, _, _, _, _, T = logits.shape
+            if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                mask_flat = self.MNI152_mask.view(-1).bool().to(logits.device)  # [V]
+                logits_f = logits.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                target_f = target.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+            else:
+                logits_f = logits.flatten(start_dim=1)
+                target_f = target.flatten(start_dim=1)
+            output = torch.stack([logits_f, target_f], dim=2)  # [B, Vmask*T or V*T, 2]
+
             self._log_rfMRI_baselines(batch, "test") 
             return (subj, output.detach().cpu())
         else:
