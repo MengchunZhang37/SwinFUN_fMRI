@@ -44,7 +44,7 @@ Follow the layout shown in cleaned_data/ (DS000030-based), or update paths in th
 ```bash
 # a)Run fMRIPrep with default settings
 # b)Run minimal preprocessing: 
-python preprocessing_fMRIprep.py
+    python utils/preprocessing_fMRIprep.py
 ```
 
 ### 3. Run the pipeline
