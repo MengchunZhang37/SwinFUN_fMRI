@@ -381,6 +381,11 @@ class DS000030(BaseDataset):
         for i, subject in enumerate(subject_dict):
             sex, target = subject_dict[subject]
             subject_path = os.path.join(img_root, subject)
+
+            if getattr(self, "downstream_task", "") == "tfMRI_3D":
+                if not os.path.exists(target):
+                    print(f"[WARNING] label not found for {subject}: {target}, skip.")
+                    continue
             
             # Count available frames
             frame_pattern = os.path.join(subject_path, 'frame_*.pt')

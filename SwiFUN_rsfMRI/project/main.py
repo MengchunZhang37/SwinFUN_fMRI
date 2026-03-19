@@ -16,6 +16,7 @@ import neptune
 from module.utils.data_module import fMRIDataModule
 from module.utils.parser import str2bool
 from module.pl_classifier import LitClassifier
+from module.pl_classifier_conditional import LitConditionalClassifier
 
 
 def cli_main():
@@ -42,11 +43,13 @@ def cli_main():
     
     parser.add_argument("--run_id", type=str, default=None,
     help="W&B run id (for resuming or setting a specific run)")
+    parser.add_argument("--classifier_variant", type=str, default="base", choices=["base", "conditional"],
+                    help="Select base classifier or conditional rfMRI classifier")
     
     temp_args, _ = parser.parse_known_args()
 
     # Set classifier
-    Classifier = LitClassifier
+    Classifier = LitConditionalClassifier if temp_args.classifier_variant == "conditional" else LitClassifier
     
     # Set dataset
     Dataset = fMRIDataModule

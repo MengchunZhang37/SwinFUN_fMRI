@@ -30,6 +30,65 @@ from einops import rearrange
 from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler, KBinsDiscretizer
 from datetime import datetime
 import gzip, pickle
+import copy
+
+
+def contrast_mse_loss(pred: torch.Tensor,
+                          target: torch.Tensor,
+                          subjects) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        根据论文 2.3 节定义 RC loss 的两个组成：
+          - within_subj_loss = L_R = 平均重建 MSE（逐样本对齐的 pred_i vs target_i）
+          - across_subj_loss = L_C = 仅在“跨 subject”对上，计算 pred_j vs target_i 的两两 MSE 并求均值
+                                (排除 i==j 以及 subj_i == subj_j 的所有对)
+        参数
+          pred:   [B, F]  已按需掩膜/展平后的模型输出
+          target: [B, F]  已按需掩膜/展平后的真值
+          subjects: 长度为 B 的 subject 标识（list/ndarray/tensor，元素可为 str 或 int）
+        返回
+          (within_subj_loss, across_subj_loss)  都是标量 tensor
+        """
+        assert pred.ndim == 2 and target.ndim == 2 and pred.shape == target.shape
+        B, Fdim = pred.shape
+        device = pred.device
+
+        # 1) L_R: 对齐样本的一对一重建 MSE（论文式 (54~61)）
+        within = F.mse_loss(pred, target, reduction="mean")
+
+        # 2) L_C: 跨 subject 的两两 MSE 平均（论文式 (62~66)）
+        # 计算 pred_j vs target_i 的 pairwise MSE（用范数恒等式避免构造 (B,B,F) 大张量）：
+        # M[j,i] = (||pred_j||^2 + ||target_i||^2 - 2*pred_j·target_i) / F
+        # pairwise mse: pred[j] vs target[i]
+        p2 = (pred * pred).sum(dim=1, keepdim=True)          # [B,1]
+        t2 = (target * target).sum(dim=1, keepdim=True).t()  # [1,B]
+        cross = pred @ target.t()                             # [B,B]
+        pair_mse = (p2 + t2 - 2.0 * cross) / float(Fdim)      # [B,B] row=j col=i
+
+        # subjects -> tensor codes
+        if isinstance(subjects, torch.Tensor):
+            s = subjects.detach().cpu()
+        else:
+            s = torch.tensor(list(subjects), dtype=torch.long) if isinstance(list(subjects)[0], (int, np.integer)) \
+                else None
+    
+        if s is None:
+            # string case: map to ints
+            uniq = {v:i for i,v in enumerate(list(subjects))}
+            s = torch.tensor([uniq[v] for v in subjects], dtype=torch.long)
+    
+        s = s.to(device)
+        same_subj = (s.view(B,1) == s.view(1,B))              # [B,B] row=i col=j (sample index)
+        diag = torch.eye(B, dtype=torch.bool, device=device)
+    
+        # pair_mse is [row=j, col=i] so we need mask in same orientation:
+        # invalid[j,i] if i==j OR subj_i==subj_j
+        invalid = diag | same_subj
+        invalid = invalid.t()  # now [row=j, col=i]
+    
+        valid = ~invalid
+        across = pair_mse[valid].mean() if valid.any() else torch.zeros((), device=device)
+    
+        return within, across
 
 class LitClassifier(pl.LightningModule):
     def __init__(self, data_module, **kwargs):
@@ -95,6 +154,12 @@ class LitClassifier(pl.LightningModule):
             self.output_head = load_model("reg_mlp", self.hparams)
         else:
             raise NotImplementedError("output head should be defined")
+
+        #add residual branch
+        if getattr(self.hparams, "use_residual_branch", False) and getattr(self.hparams, "downstream_task", "") == "rfMRI_next":
+            self.residual_head = copy.deepcopy(self.output_head)
+        else:
+            self.residual_head = None
         
         
         if getattr(self.hparams, "mask_input", False):
@@ -143,6 +208,37 @@ class LitClassifier(pl.LightningModule):
 
         if self.hparams.adjust_thresh:
             self.threshold = 0
+
+
+        # ===== ROI atlas for FC metrics (rfMRI_next) =====
+        self.use_fc_metrics = bool(getattr(self.hparams, "use_fc_metrics", False))
+
+        self.atlas_pt = getattr(self.hparams, "roi_atlas_pt", None)
+        if self.use_fc_metrics and self.atlas_pt is not None:
+            atlas = torch.load(self.atlas_pt, map_location="cpu").long()  # [96,96,96]
+            if hasattr(self, "MNI152_mask") and (self.MNI152_mask is not None):
+                atlas = atlas * self.MNI152_mask.long()
+            self.register_buffer("roi_atlas_96", atlas)
+        
+            roi_ids = torch.unique(atlas)
+            roi_ids = roi_ids[roi_ids > 0]
+            roi_ids, _ = torch.sort(roi_ids)
+            self.register_buffer("roi_ids", roi_ids)
+
+            # cache voxel indices per ROI for speed
+            roi_voxel_indices = []
+            atlas_flat = atlas.view(-1)
+            for rid in roi_ids.tolist():
+                idx = torch.nonzero(atlas_flat == rid, as_tuple=False).squeeze(1)  # [n_vox_r]
+                roi_voxel_indices.append(idx)
+            self.roi_voxel_indices = roi_voxel_indices   # Python list[Tensor], 放在CPU也行
+
+        else:
+            self.roi_atlas_96 = None
+            self.roi_ids = None
+            self.roi_voxel_indices = None 
+
+
 
     def forward(self, x):
         return self.output_head(self.model(x))
@@ -217,8 +313,6 @@ class LitClassifier(pl.LightningModule):
             img = rearrange(img, 'b t c h w d -> b c h w d t')
             
         return img
-    
-    import torch.nn.functional as F
 
     def _to_voxel_logits(self, x):
         """
@@ -314,20 +408,36 @@ class LitClassifier(pl.LightningModule):
         for k in range(1, K+1):
             # Predict the next frame (strictly use horizon=1)
             feat_next = self.model(ctx)
-            pred_next = self._project_to_voxels_time(self.output_head(feat_next), out_T=1)   # [B,1,96,96,96,1]
+            pred_next_raw = self._project_to_voxels_time(self.output_head(feat_next), out_T=1) # [B,1,96,96,96,1]
+
+            if getattr(self.hparams, "use_residual_branch", False) and (self.residual_head is not None):
+                res_raw  = self._project_to_voxels_time(self.residual_head(feat_next), out_T=1)
+                base_raw = self._rfmri_baseline_one_step(ctx, getattr(self.hparams, "residual_base", "persist"), apply_mask=False)
+                pred_next_raw = base_raw + res_raw  
+                
+            
             gt_next   = self._project_to_voxels_time(fmri[..., T_ctx + k - 1:T_ctx + k], out_T=1)
 
             if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
-                m = self.MNI152_mask[None, None, ...].to(pred_next.dtype).unsqueeze(-1)  # [1,1,96,96,96,1]
-                pred_next = pred_next * m
+                m = self.MNI152_mask[None, None, ...].to(pred_next_raw.dtype).unsqueeze(-1)  # [1,1,96,96,96,1]
+                pred_next = pred_next_raw * m
                 gt_next   = gt_next   * m
+            else:
+                pred_next = pred_next_raw
             
             # Compute mse@k / r@k
-            pred_f = pred_next.flatten(start_dim=1)
-            gt_f   = gt_next.flatten(start_dim=1)
-            mse_k  = F.mse_loss(pred_f, gt_f)
+            # MSE@k (average only within brain region)
+            m6 = self.MNI152_mask[None, None, ...].unsqueeze(-1).float()\
+                    .to(pred_next.device).expand_as(pred_next)          # [B,1,96,96,96,1]
+            se = (pred_next - gt_next).pow(2)
+            mse_k = (se * m6).sum() / m6.sum().clamp_min(1.0)
 
-            # r@k (overall Pearson after flattening)
+            # r@k: Pearson correlation along spatial dimensions (only within brain region)
+            pred_sp = pred_next.squeeze(1).squeeze(-1)                  # [B,96,96,96]
+            gt_sp   = gt_next.squeeze(1).squeeze(-1)                    # [B,96,96,96]
+            mask_flat = self.MNI152_mask.view(-1).bool()
+            pred_f = pred_sp.view(B, -1)[:, mask_flat]                  # [B, V_mask]
+            gt_f   = gt_sp.view(B, -1)[:, mask_flat]                    # [B, V_mask]
             x = pred_f - pred_f.mean(dim=1, keepdim=True)
             y = gt_f   - gt_f.mean(dim=1, keepdim=True)
             r_k = (x * y).sum(dim=1) / (x.norm(dim=1) * y.norm(dim=1) + 1e-6)
@@ -337,19 +447,66 @@ class LitClassifier(pl.LightningModule):
             self.log(f"valid_r@{k}",   r_k,   prog_bar=False, sync_dist=False, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
 
             # Sliding window: drop the leftmost frame and append the prediction
-            ctx = torch.cat([ctx[..., 1:], pred_next], dim=-1)
+            ctx = torch.cat([ctx[..., 1:], pred_next_raw], dim=-1)
 
+    
     @staticmethod
-    def _r_time_mean(x, y):
-        """Mean Pearson correlation along the time dimension;
-        supports inputs of shape [B,1,D,H,W,T] or [B,V,T]"""
-        if x.ndim == 6:  # reshape to [B,V,T]
-            x = x.view(x.shape[0], -1, x.shape[-1])
-        if y.ndim == 6:
-            y = y.view(y.shape[0], -1, y.shape[-1])
-        xz = (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + 1e-6)
-        yz = (y - y.mean(-1, keepdim=True)) / (y.std(-1, keepdim=True) + 1e-6)
-        return (xz * yz).mean()
+    def _r_time_mean(x, y, mask=None):
+        """Mean Pearson correlation along time; supports [B,1,D,H,W,T] or [B,V,T].
+           If mask is provided (96x96x96 bool), only voxels inside mask are used.
+        """
+        def to_BVT(t):
+            if t.ndim == 6:
+                return t.view(t.shape[0], -1, t.shape[-1])
+            if t.ndim == 3:
+                return t
+            raise AssertionError(f"expect [B,1,D,H,W,T] or [B,V,T], got {tuple(t.shape)}")
+
+        X = to_BVT(x)
+        Y = to_BVT(y)
+        if mask is not None:
+            m = mask.view(-1).bool()
+            X = X[:, m, :]
+            Y = Y[:, m, :]
+
+        Xz = (X - X.mean(-1, keepdim=True)) / (X.std(-1, keepdim=True) + 1e-6)
+        Yz = (Y - Y.mean(-1, keepdim=True)) / (Y.std(-1, keepdim=True) + 1e-6)
+        return (Xz * Yz).mean()
+
+    def _voxel_to_roi_ts(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B,1,96,96,96,T]
+        return: [B, N_roi, T]
+        """
+        assert self.roi_atlas_96 is not None and self.roi_ids is not None
+        B, C, H, W, D, T = x.shape
+        assert C == 1 and (H,W,D) == (96,96,96)
+    
+        x_flat = x.view(B, V, T)                        # [B,V,T]
+    
+        # compute ROI mean time series
+        roi_ts_list = []
+        for idx in self.roi_voxel_indices:
+            idx = idx.to(x_flat.device)
+            roi_ts_list.append(x_flat.index_select(1, idx).mean(dim=1))  # [B,T]
+    
+        return torch.stack(roi_ts_list, dim=1)  # [B,N,T]
+    
+    def _roi_ts_to_fc_vec(self, roi_ts: torch.Tensor) -> torch.Tensor:
+        """
+        roi_ts: [B,N,T]
+        return: [B, N*(N-1)/2]  (upper triangle)
+        """
+        B, N, T = roi_ts.shape
+        z = roi_ts - roi_ts.mean(dim=-1, keepdim=True)
+        z = z / (roi_ts.std(dim=-1, keepdim=True) + 1e-6)
+    
+        fc = torch.einsum("bnt,bmt->bnm", z, z) / float(T)  # [B,N,N]
+    
+        iu = torch.triu_indices(N, N, offset=1, device=fc.device)
+        vec = fc[:, iu[0], iu[1]]                           # [B, F]
+        return vec
+
     
     @torch.no_grad()
     def _log_rfMRI_baselines(self, batch, mode="valid"):
@@ -393,31 +550,46 @@ class LitClassifier(pl.LightningModule):
 
 
         # Apply mask if available
-        if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
-            m = self.MNI152_mask[None, None, ...].bool().unsqueeze(-1).expand_as(y_future)
-            y_future     = y_future.masked_fill(~m, 0.0)
-            base_persist = base_persist.masked_fill(~m, 0.0)
-            base_mean    = base_mean.masked_fill(~m, 0.0)
+        if not hasattr(self, "MNI152_mask") or self.MNI152_mask is None:
+            return  
 
-        # Errors
-        yf = y_future.flatten(start_dim=1)
-        pf = base_persist.flatten(start_dim=1)
-        mf = base_mean.flatten(start_dim=1)
-        mse_p, mae_p = F.mse_loss(pf, yf), F.l1_loss(pf, yf)
-        mse_m, mae_m = F.mse_loss(mf, yf), F.l1_loss(mf, yf)
+        m6 = self.MNI152_mask[None, None, ...].unsqueeze(-1).float().to(y_future.device).expand_as(y_future)  # [B,1,96,96,96,T_hz]
 
-        # r_time (using the helper function)
-        r_p = self._r_time_mean(base_persist, y_future)
-        r_m = self._r_time_mean(base_mean,    y_future)
+        def mse_mask(a, b):
+            se = (a - b).pow(2) * m6
+            return se.sum() / m6.sum().clamp_min(1.0)
 
-        # Log metrics
+        def mae_mask(a, b):
+            ae = (a - b).abs() * m6
+            return ae.sum() / m6.sum().clamp_min(1.0)
+
+        mse_p = mse_mask(base_persist, y_future)
+        mae_p = mae_mask(base_persist, y_future)
+        mse_m = mse_mask(base_mean,    y_future)
+        mae_m = mae_mask(base_mean,    y_future)
+
+        r_p = self._r_time_mean(base_persist, y_future, mask=self.MNI152_mask)
+        r_m = self._r_time_mean(base_mean,    y_future, mask=self.MNI152_mask)
+        
+        #check
+        with torch.no_grad():
+            y_std = torch.sqrt(((y_future**2) * m6).sum() / m6.sum().clamp_min(1.0))
+            rmse_p = torch.sqrt(((base_persist - y_future).pow(2) * m6).sum() / m6.sum().clamp_min(1.0))
+            rel_rmse_p = rmse_p / (y_std + 1e-8)
+            rel_rmse_expected = torch.sqrt(torch.clamp(2 * (1.0 - r_p), min=0.0))
+        self.log(f"{mode}_y_std_mask", y_std, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_rmse_baseline_persist", rmse_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_relrmse_persist", rel_rmse_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_relrmse_expected_from_rho1", rel_rmse_expected, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+
         self.log(f"{mode}_mse_baseline_persist", mse_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
         self.log(f"{mode}_mae_baseline_persist", mae_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
         self.log(f"{mode}_r_time_baseline_persist", r_p, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
 
-        self.log(f"{mode}_mse_baseline_ctxmean", mse_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
-        self.log(f"{mode}_mae_baseline_ctxmean", mae_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_mse_baseline_ctxmean",  mse_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_mae_baseline_ctxmean",  mae_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
         self.log(f"{mode}_r_time_baseline_ctxmean", r_m, on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+        self.log(f"{mode}_mask_fraction", self.MNI152_mask.float().mean(), on_step=False, on_epoch=True)
 
     def _tf_ratio(self):
         if not self.training:
@@ -443,6 +615,24 @@ class LitClassifier(pl.LightningModule):
         return base
 
     
+    def _rfmri_baseline_one_step(self, ctx, kind: str, apply_mask: bool = True):
+        """
+        ctx: [B,1,96,96,96,T_ctx]
+        return: baseline next-frame [B,1,96,96,96,1]
+        """
+        if kind == "persist":
+            base = ctx[..., -1:]
+        elif kind == "ctxmean":
+            base = ctx.mean(dim=-1, keepdim=True)
+        else:
+            raise ValueError(f"Unknown residual_base={kind}")
+    
+        if apply_mask and hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+            m = self.MNI152_mask[None, None, ...].to(base.dtype).unsqueeze(-1)
+            base = base * m
+        return base
+
+    
     def _compute_logits(self, batch, augment_during_training=None):
         fmri, subj, target_value, tr, sex = batch.values()
        
@@ -464,38 +654,87 @@ class LitClassifier(pl.LightningModule):
                 T_hz  = int(self.hparams.pred_horizon)
             assert T_ctx + T_hz <= T_full, "pred_context + pred_horizon > T_full"
 
-            ctx = fmri[..., :T_ctx]                    # [B,1,96,96,96,T_ctx]
+            ctx = fmri[..., :T_ctx]         
+            # [B,1,96,96,96,T_ctx]
             y_future = fmri[..., T_ctx:T_ctx+T_hz]     # [B,1,96,96,96,T_hz]
             tf_ratio = self._tf_ratio()
-        
-            preds = []
+
+            
+            preds_main = []
+            preds_res  = [] if (self.residual_head is not None) else None
             for t in range(T_hz):
                 feat_t = self.model(ctx)
-                pred_t = self._project_to_voxels_time(self.output_head(feat_t), out_T=1)  # [B,1,96,96,96,1]
-
+            
+                # ===== main branch (unchanged semantics) =====
+                pred_t_raw = self._project_to_voxels_time(self.output_head(feat_t), out_T=1)  # [B,1,96,96,96,1]
                 # mask (if any)
                 if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
-                    m = self.MNI152_mask[None, None, ...].to(pred_t.dtype)  # [1,1,96,96,96]
-                    pred_t = pred_t * m.unsqueeze(-1)
+                    m = self.MNI152_mask[None, None, ...].to(pred_t_raw.dtype).unsqueeze(-1)
+                    pred_t_masked = pred_t_raw * m
+                else:
+                    pred_t_masked = pred_t_raw
+            
+                preds_main.append(pred_t_raw)
+            
+                # ========= residual branch ==========
+                pred_res_raw = None
+                pred_res_masked = None
+                if self.residual_head is not None:
+                    # residual predicted by head (RAW, no mask, so it can affect ctx)
+                    res_raw = self._project_to_voxels_time(self.residual_head(feat_t), out_T=1)  # [B,1,96,96,96,1]
+            
+                    # baseline (RAW, no mask, so rollout semantics is clean)
+                    base_raw = self._rfmri_baseline_one_step(ctx, getattr(self.hparams, "residual_base", "persist"), apply_mask=False)
+                    pred_res_raw = base_raw + res_raw  # fed back to ctx
+            
+                    # masked version only for loss/metric logging
+                    if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                        m = self.MNI152_mask[None, None, ...].to(pred_res_raw.dtype).unsqueeze(-1)
+                        pred_res_masked = pred_res_raw * m
+                    else:
+                        pred_res_masked = pred_res_raw
+            
+                    preds_res.append(pred_res_masked)
 
-                preds.append(pred_t)
-
-                # teacher forcing
+            
+                # ===== teacher forcing update =====
                 use_teacher = (torch.rand((), device=ctx.device) < tf_ratio).item()
-                next_frame = y_future[..., t:t+1] if use_teacher else pred_t
+                if use_teacher:
+                    next_frame = y_future[..., t:t+1]     # GT
+                else:
+                    if pred_res_raw is not None:
+                        next_frame = pred_res_raw         # residual AR
+                    else:
+                        next_frame = pred_t_raw           # main AR
 
-                # sliding window update (if you want to fix window length to T_ctx, use the line below instead)
                 ctx = torch.cat([ctx, next_frame], dim=-1)
-                # fixed window: ctx = torch.cat([ctx[..., 1:], next_frame], dim=-1)
+                if getattr(self.hparams, "ctx_update", "sliding") == "sliding":
+                    # keep fixed length T_ctx
+                    if ctx.shape[-1] > T_ctx:
+                        ctx = ctx[..., -T_ctx:]
+                elif self.hparams.ctx_update == "growing":
+                    # do nothing, let it grow
+                    pass
+                else:
+                    raise ValueError(f"Unknown ctx_update={self.hparams.ctx_update}")
 
-            logits = torch.cat(preds, dim=-1)          # [B,1,96,96,96,T_hz]
+
+            logits_main = torch.cat(preds_main, dim=-1)          # [B,1,96,96,96,T_hz]
             target = y_future.clone()
-            if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
-                m = self.MNI152_mask[None, None, ...].to(target.dtype).unsqueeze(-1).expand_as(target)
-                target = target * m
+            #only use mask in loss/metric, don't use in the rollout
+            # if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+            #     m = self.MNI152_mask[None, None, ...].to(target.dtype).unsqueeze(-1).expand_as(target)
+            #     target = target * m
 
             # subj = batch["subject_name"]
-            return subj, logits, target
+
+            # stash residual logits for loss
+            if preds_res is not None:
+                self._last_rfMRI_logits_res = torch.cat(preds_res, dim=-1)  # [B,1,96,96,96,T_hz]
+            else:
+                self._last_rfMRI_logits_res = None
+            
+            return subj, logits_main, target
 
 
         # ===== tfMRI =====
@@ -522,49 +761,171 @@ class LitClassifier(pl.LightningModule):
                 target = (unnormalized_target - self.scaler.data_min_[0]) / (self.scaler.data_max_[0] - self.scaler.data_min_[0])
         
         return subj, logits, target
+
+    
     
     def _calculate_loss(self, batch, batch_idx, mode):
         subj, logits, target = self._compute_logits(batch, augment_during_training = self.hparams.augment_during_training)
         
         #=== rfMRI ===
         if getattr(self.hparams, "downstream_task", "") == "rfMRI_next":
+             
             # [B,1,96,96,96,T] -> [B, V*T]
             logits_f = logits.flatten(start_dim=1)
             target_f = target.flatten(start_dim=1)
 
-            if self.hparams.loss_type == "mae":
-                loss = F.l1_loss(logits_f, target_f)
-            elif self.hparams.loss_type == "rc":
-                within_subj_loss, across_subj_loss = contrast_mse_loss(logits_f, target_f, subj)
-                loss = (
-                    self.hparams.within_subj_margin * within_subj_loss
-                    - self.hparams.across_subj_margin * across_subj_loss
-                )
-            else:  # default MSE
-                loss = F.mse_loss(logits_f, target_f)
+            use_fc = bool(getattr(self.hparams, "use_fc_metrics", False)) and (self.roi_atlas_96 is not None)
+            if use_fc:
+                # logits/target: [B,1,96,96,96,T] -> FC vec [B,F]
+                roi_ts_pred = self._voxel_to_roi_ts(logits)
+                roi_ts_gt   = self._voxel_to_roi_ts(target)
+                feat_pred   = self._roi_ts_to_fc_vec(roi_ts_pred)  # [B,F]
+                feat_gt     = self._roi_ts_to_fc_vec(roi_ts_gt)    # [B,F]
+
+                # ===== loss on FC vec =====
+                if self.hparams.loss_type == "mae":
+                    loss = F.l1_loss(feat_pred, feat_gt)
+                    within_subj_loss = loss
+                    across_subj_loss = torch.zeros((), device=logits.device)
+            
+                elif self.hparams.loss_type == "rc":
+                    within_subj_loss, across_subj_loss = contrast_mse_loss(feat_pred, feat_gt, subj)
+                    loss = (self.hparams.within_subj_margin * within_subj_loss
+                            - self.hparams.across_subj_margin * across_subj_loss)
+            
+                else:  # mse
+                    loss = F.mse_loss(feat_pred, feat_gt)
+                    within_subj_loss = loss
+                    across_subj_loss = torch.zeros((), device=logits.device)
+            
+            else:
+                # ===== original voxel loss =====
+                if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                    m6 = (
+                        self.MNI152_mask[None, None, ...]
+                        .unsqueeze(-1)
+                        .float()
+                        .to(logits.device)
+                        .expand_as(logits)
+                    )  # [B,1,96,96,96,T]
+                else:
+                    m6 = torch.ones_like(logits, dtype=torch.float32)
+    
+                if self.hparams.loss_type == "mae":
+                    # MAE averaged within the mask
+                    loss = ((logits - target).abs() * m6).sum() / m6.sum().clamp_min(1.0)
+                    within_subj_loss = loss
+                    across_subj_loss = torch.zeros(1, device=logits.device)
+                elif self.hparams.loss_type == "rc":
+                    # Apply mask and then flatten (keep only brain-region voxels)
+                    B, _, _, _, _, T = logits.shape
+                    if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                        mask_flat = self.MNI152_mask.view(-1).bool()
+                        L   = logits.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                        Tgt = target.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                    else:
+                        L   = logits.flatten(start_dim=1)
+                        Tgt = target.flatten(start_dim=1)
+                    within_subj_loss, across_subj_loss = contrast_mse_loss(L, Tgt, subj)
+                    loss = (
+                        self.hparams.within_subj_margin * within_subj_loss
+                        - self.hparams.across_subj_margin * across_subj_loss
+                    )
+                else:  # MSE averaged within the mask
+                    loss = ((logits - target).pow(2) * m6).sum() / m6.sum().clamp_min(1.0)
+                    within_subj_loss = loss
+                    across_subj_loss = torch.zeros(1, device=logits.device)
+
 
             # Log r (temporal correlation): treat [B,1,96,96,96,T] as [B, V, T]
             with torch.no_grad():
-                L   = logits.view(logits.shape[0], -1, logits.shape[-1])
-                Tgt = target.view(target.shape[0],  -1, target.shape[-1])
-                Lz   = (L   - L.mean(-1, keepdim=True)) / (L.std(-1, keepdim=True) + 1e-6)
-                Tgtz = (Tgt - Tgt.mean(-1, keepdim=True)) / (Tgt.std(-1, keepdim=True) + 1e-6)
-                r_time_mean = (Lz * Tgtz).mean()
-
-            result_dict = {
-                f"{mode}_loss": loss,
-                f"{mode}_mse": F.mse_loss(logits_f, target_f),
-                f"{mode}_l1_loss": F.l1_loss(logits_f, target_f),
-                f"{mode}_r_time_mean": r_time_mean,
-            }
+                if use_fc:
+                    mse_val = F.mse_loss(feat_pred, feat_gt)
+                    l1_val  = F.l1_loss(feat_pred, feat_gt)
+                    result_dict = {
+                        f"{mode}_loss": loss,
+                        f"{mode}_mse": mse_val,
+                        f"{mode}_l1_loss": l1_val,
+                    }
+                else:
+                    if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                        r_time_mean = self._r_time_mean(logits, target, mask=self.MNI152_mask)
+                    else:
+                        r_time_mean = self._r_time_mean(logits, target)
+                    mse_val = ((logits - target).pow(2) * m6).sum() / m6.sum().clamp_min(1.0)
+                    l1_val  = ((logits - target).abs()   * m6).sum() / m6.sum().clamp_min(1.0)
+    
+                    result_dict = {
+                        f"{mode}_loss": loss,
+                        f"{mode}_mse": mse_val,
+                        f"{mode}_l1_loss": l1_val,
+                        f"{mode}_r_time_mean": r_time_mean,
+                    }
             self.log_dict(
                 result_dict, prog_bar=True, sync_dist=False, add_dataloader_idx=False,
                 on_step=True, on_epoch=True, batch_size=self.hparams.batch_size
             )
+
+            #============= residual loss ==============
+            if getattr(self.hparams, "use_residual_branch", False):
+                logits_res = getattr(self, "_last_rfMRI_logits_res", None)
+                if logits_res is not None:
+                    with torch.no_grad():
+                        if use_fc:
+                            roi_ts_res = self._voxel_to_roi_ts(logits_res)
+                            feat_res   = self._roi_ts_to_fc_vec(roi_ts_res)
+                            mse_res = F.mse_loss(feat_res, feat_gt)
+                            l1_res  = F.l1_loss(feat_res, feat_gt)
+                            self.log_dict(
+                                {f"{mode}_mse_residual_branch": mse_res,
+                                 f"{mode}_l1_residual_branch":  l1_res},
+                                on_step=False, on_epoch=True, prog_bar=False,
+                                batch_size=self.hparams.batch_size
+                            )
+                            w = float(getattr(self.hparams, "residual_l2", 0.0))
+                            if w > 0:
+                                loss = loss + w * mse_res
+                                self.log(f"{mode}_loss_residual_branch", mse_res,
+                                         on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+                        else:
+                            mse_res = ((logits_res - target).pow(2) * m6).sum() / m6.sum().clamp_min(1.0)
+                            l1_res  = ((logits_res - target).abs()   * m6).sum() / m6.sum().clamp_min(1.0)
+                            if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                                r_res = self._r_time_mean(logits_res, target, mask=self.MNI152_mask)
+                            else:
+                                r_res = self._r_time_mean(logits_res, target)
+    
+                        self.log_dict(
+                            {
+                                f"{mode}_mse_residual_branch": mse_res,
+                                f"{mode}_l1_residual_branch": l1_res,
+                                f"{mode}_r_time_residual_branch": r_res,
+                            },
+                            on_step=False, on_epoch=True, prog_bar=False,
+                            batch_size=self.hparams.batch_size
+                        )
+    
+                        # optional：add residual loss into main loss（ 0 by default only for slog）
+                        w = float(getattr(self.hparams, "residual_l2", 0.0))
+                        if w > 0:
+                            loss_res = ((logits_res - target).pow(2) * m6).sum() / m6.sum().clamp_min(1.0)
+                            loss = loss + w * loss_res
+                            self.log(f"{mode}_loss_residual_branch", loss_res,
+                                     on_step=False, on_epoch=True, batch_size=self.hparams.batch_size)
+
             return loss
 
         #=== tfMRI ===
         if 'tfMRI' in self.hparams.downstream_task:
+            B = logits.shape[0]
+            if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                mask_flat = self.MNI152_mask.view(-1).bool()
+                logits = logits.view(B, -1)[:, mask_flat]
+                target = target.view(B, -1)[:, mask_flat]
+            else:
+                logits = logits.flatten(start_dim=1)
+                target = target.flatten(start_dim=1)
+                
             if self.hparams.loss_type == 'mse':
                 logits = logits.flatten(start_dim=1) # (batch,mask_dim)
                 target = target.flatten(start_dim=1) # (batch,mask_dim)
@@ -613,70 +974,52 @@ class LitClassifier(pl.LightningModule):
         return loss
 
     def _evaluate_metrics(self, subj_array, total_out, mode):
-        # print('total_out.device',total_out.device)
-        # (total iteration/world_size) numbers of samples are passed into _evaluate_metrics.
-        subjects = np.unique(subj_array)
-        
+        """
+        total_out: torch.Tensor on CPU or GPU
+          - tfMRI / rfMRI_next(voxel): [N_samples, F, 2]
+          - rfMRI_next(FC vec):        [N_samples, F, 2]  (F = N_roi*(N_roi-1)/2)
+        subj_array: np.array of subject ids, length N_samples
+        """
         task = getattr(self.hparams, "downstream_task", "")
-        if ('tfMRI' in task) or (task == 'rfMRI_next'):
-            subj_avg_logits = torch.empty(len(subjects), total_out.shape[1], device=total_out.device) 
-            subj_targets = torch.empty(len(subjects), total_out.shape[1], device=total_out.device) 
-            for idx, subj in enumerate(subjects):
-                subj_logits = total_out[subj_array == subj,:,0]
-                subj_avg_logits[idx,:] = torch.mean(subj_logits, axis=0) # average predicted task maps of the specific subject
-                subj_targets[idx,:] = total_out[subj_array == subj,:,1][0,:]
+        subjects = np.unique(subj_array)
+    
+        def aggregate_subject_level(get_gt_mode: str):
+            """
+            get_gt_mode:
+              - "first": GT per subject assumed constant across segments
+              - "mean":  GT per subject varies across segments, average it
+            """
+            device = total_out.device
+            Fdim = total_out.shape[1]
+            subj_pred = torch.empty((len(subjects), Fdim), device=device)
+            subj_gt   = torch.empty((len(subjects), Fdim), device=device)
+    
+            for si, s in enumerate(subjects):
+                idxs = np.where(subj_array == s)[0]
+                pred_seg = total_out[idxs, :, 0]  # [n_seg, F]
+                gt_seg   = total_out[idxs, :, 1]  # [n_seg, F]
+    
+                subj_pred[si] = pred_seg.mean(dim=0)
+    
+                if get_gt_mode == "first":
+                    subj_gt[si] = gt_seg[0]
+                elif get_gt_mode == "mean":
+                    subj_gt[si] = gt_seg.mean(dim=0)
+                else:
+                    raise ValueError(f"Unknown get_gt_mode={get_gt_mode}")
+    
+            return subj_pred, subj_gt
+    
+        if task == "rfMRI_next":
+            # GT mean
+            subj_avg_logits, subj_targets = aggregate_subject_level(get_gt_mode="mean")
+    
+        elif "tfMRI" in task:
+            # GT first
+            subj_avg_logits, subj_targets = aggregate_subject_level(get_gt_mode="first")
 
-            mse = F.mse_loss(subj_avg_logits, subj_targets)
-            mae = F.l1_loss(subj_avg_logits, subj_targets)
-            if subj_avg_logits.ndim == 1 : # voxels (only)
-                A = subj_avg_logits.unsqueeze(1)
-                B = subj_targets.unsqueeze(1)
-            elif subj_avg_logits.ndim == 2 :
-                A = torch.transpose(subj_avg_logits,0,1) # voxels * subjects
-                B = torch.transpose(subj_targets,0,1)
-            else:
-                print(f'the dimension of target and logits are not as expected:{subj_avg_logits.ndim}')
-            # assumes verticesXsubject matrices, returns subjectXsubject corrmat 
-            A = (A - A.mean(axis=0)) / A.std(axis=0)
-            B = (B - B.mean(axis=0)) / B.std(axis=0)
-            
-            corrmat = torch.einsum("ik,kj->ij",B.t(), A) / B.shape[0] 
-            #print('corrmat',corrmat) 
-            
-            corrmat = corrmat.detach().cpu()
-            #top1_diag_acc
-            top1_diag_acc = torch.mean((torch.argmax(corrmat,axis=1) == torch.arange(corrmat.shape[0])).float()).item()
-            
-            #diagonality_rank_score
-            sorted_tensor = torch.argsort(corrmat,axis=1)
-            diag_rank_idx = torch.mean(torch.tensor([torch.where(sorted_tensor[i,:]==i )[0] / (corrmat.shape[0]-1) for i in range(corrmat.shape[0])]).float()).item()
-
-            diag = torch.einsum('ii->i', corrmat) # torch.diagonal(corrmat)
-            off_diag_up_low = (torch.triu(corrmat,diagonal=1) + torch.tril(corrmat,diagonal=-1))
-            # print('off_diag_up_low.shape',off_diag_up_low.shape)
-            # print('off_diag_up_low',off_diag_up_low)
-            off_diag = off_diag_up_low[off_diag_up_low!=0]
-        
-            diag_mean = torch.mean(diag).item()
-            diag_median = torch.median(diag).item()
-            diag_index = diag.mean() - off_diag.mean()
-
-            KS_D=scipy.stats.kstest(diag.numpy(),off_diag.numpy()).statistic
-            KS_pvalue=scipy.stats.kstest(diag.numpy(),off_diag.numpy()).pvalue
-            
-
-            self.log(f"{mode}_diag_mean", diag_mean, sync_dist=True)
-            self.log(f"{mode}_diag_median", diag_median, sync_dist=True)
-            self.log(f"{mode}_top1_diag_acc", top1_diag_acc, sync_dist=True)
-            self.log(f"{mode}_diag_index", diag_index, sync_dist=True)
-            self.log(f"{mode}_diag_rank_idx", diag_rank_idx, sync_dist=True)
-            self.log(f"{mode}_KS_D", KS_D, sync_dist=True)
-            self.log(f"{mode}_KS_pvalue", KS_pvalue, sync_dist=True)
-            self.log(f"{mode}_mse", mse, sync_dist=True)
-            self.log(f"{mode}_mae", mae, sync_dist=True)
-        
-        # meta data prediction
         else:
+            # meta data prediction
             subj_avg_logits = []
             subj_targets = []
             for subj in subjects:
@@ -747,6 +1090,63 @@ class LitClassifier(pl.LightningModule):
                 self.log(f"{mode}_mae", mae, sync_dist=True)
                 self.log(f"{mode}_adjusted_mse", adjusted_mse, sync_dist=True) 
                 self.log(f"{mode}_adjusted_mae", adjusted_mae, sync_dist=True) 
+            return
+    
+        # ===== shared vector metrics for tfMRI / rfMRI_next =====
+        mse = F.mse_loss(subj_avg_logits, subj_targets)
+        mae = F.l1_loss(subj_avg_logits, subj_targets)
+        if subj_avg_logits.ndim == 1 : # voxels (only)
+            A = subj_avg_logits.unsqueeze(1)
+            B = subj_targets.unsqueeze(1)
+        elif subj_avg_logits.ndim == 2 :
+            A = torch.transpose(subj_avg_logits,0,1) # voxels * subjects
+            B = torch.transpose(subj_targets,0,1)
+        else:
+            print(f'the dimension of target and logits are not as expected:{subj_avg_logits.ndim}')
+        # assumes verticesXsubject matrices, returns subjectXsubject corrmat 
+        A = (A - A.mean(axis=0)) / A.std(axis=0)
+        B = (B - B.mean(axis=0)) / B.std(axis=0)
+        
+        corrmat = torch.einsum("ik,kj->ij",B.t(), A) / B.shape[0] 
+        #print('corrmat',corrmat) 
+        
+        corrmat = corrmat.detach().cpu()
+        #top1_diag_acc
+        top1_diag_acc = torch.mean((torch.argmax(corrmat,axis=1) == torch.arange(corrmat.shape[0])).float()).item()
+        
+        #diagonality_rank_score
+        sorted_tensor = torch.argsort(corrmat,axis=1)
+        diag_rank_idx = torch.mean(torch.tensor([torch.where(sorted_tensor[i,:]==i )[0] / (corrmat.shape[0]-1) for i in range(corrmat.shape[0])]).float()).item()
+    
+        diag = torch.einsum('ii->i', corrmat) # torch.diagonal(corrmat)
+        # off_diag_up_low = (torch.triu(corrmat,diagonal=1) + torch.tril(corrmat,diagonal=-1))
+        # # print('off_diag_up_low.shape',off_diag_up_low.shape)
+        # # print('off_diag_up_low',off_diag_up_low)
+        # off_diag = off_diag_up_low[off_diag_up_low!=0]
+    
+        n = corrmat.shape[0]
+        mask_off = ~torch.eye(n, dtype=torch.bool)
+        off_diag = corrmat[mask_off]
+    
+        diag_mean = torch.mean(diag).item()
+        diag_median = torch.median(diag).item()
+        diag_index = diag.mean() - off_diag.mean()
+    
+        KS_D=scipy.stats.kstest(diag.numpy(),off_diag.numpy()).statistic
+        KS_pvalue=scipy.stats.kstest(diag.numpy(),off_diag.numpy()).pvalue
+        
+    
+        self.log(f"{mode}_diag_mean", diag_mean, sync_dist=True)
+        self.log(f"{mode}_diag_median", diag_median, sync_dist=True)
+        self.log(f"{mode}_top1_diag_acc", top1_diag_acc, sync_dist=True)
+        self.log(f"{mode}_diag_index", diag_index, sync_dist=True)
+        self.log(f"{mode}_diag_rank_idx", diag_rank_idx, sync_dist=True)
+        self.log(f"{mode}_KS_D", KS_D, sync_dist=True)
+        self.log(f"{mode}_KS_pvalue", KS_pvalue, sync_dist=True)
+        self.log(f"{mode}_mse", mse, sync_dist=True)
+        self.log(f"{mode}_mae", mae, sync_dist=True)
+        
+        
 
     def training_step(self, batch, batch_idx):
         loss = self._calculate_loss(batch, batch_idx, mode="train") 
@@ -762,21 +1162,32 @@ class LitClassifier(pl.LightningModule):
             output = torch.stack([logits, target], dim=2) # batch, voxels, 2
             return (subj, output.detach().cpu())
         elif task == 'rfMRI_next':
-            subj, logits, target = self._compute_logits(batch)              # logits/target: [B,1,96,96,96,T]
-            logits_f = logits.flatten(start_dim=1)                          # [B, V*T]
-            target_f = target.flatten(start_dim=1)                          # [B, V*T]
-            output = torch.stack([logits_f, target_f], dim=2)               # [B, V*T, 2]
-
-            # Perform rollout curves only on the first validation dataloader to avoid duplicate logging
+            subj, logits, target = self._compute_logits(batch)  # logits/target: [B,1,96,96,96,T]
+            if self.use_fc_metrics and (self.roi_atlas_96 is not None):
+                # voxel -> ROI ts -> FC vec
+                roi_ts_pred = self._voxel_to_roi_ts(logits)
+                roi_ts_gt   = self._voxel_to_roi_ts(target)
+                feat_pred   = self._roi_ts_to_fc_vec(roi_ts_pred)   # [B,F]
+                feat_gt     = self._roi_ts_to_fc_vec(roi_ts_gt)     # [B,F]
+                output = torch.stack([feat_pred, feat_gt], dim=2)   # [B,F,2]
+            else:
+                # fallback: your old behavior
+                B, _, _, _, _, T = logits.shape
+                if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                    mask_flat = self.MNI152_mask.view(-1).bool().to(logits.device)
+                    logits_f = logits.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                    target_f = target.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                else:
+                    logits_f = logits.flatten(start_dim=1)
+                    target_f = target.flatten(start_dim=1)
+                output = torch.stack([logits_f, target_f], dim=2)
+        
             if dataloader_idx == 0:
-                self._rollout_log_k_curves(batch)                           # 只打 log，不影响返回
-                self._log_rfMRI_baselines(batch, "valid") 
-
+                self._rollout_log_k_curves(batch)
+                self._log_rfMRI_baselines(batch, "valid")
+        
             return (subj, output.detach().cpu())
-        else:
-            subj, logits, target = self._compute_logits(batch)
-            output = torch.stack([logits.squeeze(), target.squeeze()], dim=1)
-            return (subj, output.detach().cpu())
+            
 
     def validation_epoch_end(self, outputs):
         # called at the end of the validation epoch
@@ -916,14 +1327,22 @@ class LitClassifier(pl.LightningModule):
 
     def _save_predicted_map_and_target(self, subj_array, total_out, mode, tag="last"):
         subjects = np.unique(subj_array)
+        task = getattr(self.hparams, "downstream_task", "")
 
         # Aggregate to per-subject level
         subj_avg_logits = np.empty((len(subjects), total_out.shape[1]))
         subj_targets    = np.empty((len(subjects), total_out.shape[1]))
         for idx, subj in enumerate(subjects):
-            subj_logits = total_out[subj_array == subj, :, 0]
-            subj_avg_logits[idx, :] = torch.mean(subj_logits, axis=0).detach().cpu().numpy()
-            subj_targets[idx, :]    = total_out[subj_array == subj, :, 1][0, :].detach().cpu().numpy()
+            pred_seg = total_out[subj_array == subj, :, 0]   # [n_seg, F]
+            gt_seg   = total_out[subj_array == subj, :, 1]   # [n_seg, F]
+    
+            subj_avg_logits[idx, :] = pred_seg.mean(dim=0).detach().cpu().numpy()
+    
+            if task == "rfMRI_next":
+                subj_targets[idx, :] = gt_seg.mean(dim=0).detach().cpu().numpy()   # mean
+            else:
+                subj_targets[idx, :] = gt_seg[0].detach().cpu().numpy()            # first (tfMRI)
+
 
         if self.trainer.is_global_zero:
             # Output directory: use PRED_OUT_DIR if available; 
@@ -958,16 +1377,30 @@ class LitClassifier(pl.LightningModule):
             output = torch.stack([logits, target], dim=2) # batch, voxels, 2
             return (subj, output)
         elif task == 'rfMRI_next':
-            subj, logits, target = self._compute_logits(batch)              # logits/target: [B,1,96,96,96,T]
-            logits_f = logits.flatten(start_dim=1)                          # [B, V*T]
-            target_f = target.flatten(start_dim=1)                          # [B, V*T]
-            output = torch.stack([logits_f, target_f], dim=2)               # [B, V*T, 2]
-            self._log_rfMRI_baselines(batch, "test") 
+            subj, logits, target = self._compute_logits(batch)  # [B,1,96,96,96,T]
+        
+            if self.use_fc_metrics and (self.roi_atlas_96 is not None):
+                # voxel -> ROI ts -> FC vec
+                roi_ts_pred = self._voxel_to_roi_ts(logits)
+                roi_ts_gt   = self._voxel_to_roi_ts(target)
+                feat_pred   = self._roi_ts_to_fc_vec(roi_ts_pred)   # [B,F]
+                feat_gt     = self._roi_ts_to_fc_vec(roi_ts_gt)     # [B,F]
+                output      = torch.stack([feat_pred, feat_gt], dim=2)  # [B,F,2]
+            else:
+                # fallback: old behavior
+                B, _, _, _, _, T = logits.shape
+                if hasattr(self, "MNI152_mask") and self.MNI152_mask is not None:
+                    mask_flat = self.MNI152_mask.view(-1).bool().to(logits.device)
+                    logits_f = logits.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                    target_f = target.view(B, -1, T)[:, mask_flat, :].reshape(B, -1)
+                else:
+                    logits_f = logits.flatten(start_dim=1)
+                    target_f = target.flatten(start_dim=1)
+                output = torch.stack([logits_f, target_f], dim=2)
+        
+            self._log_rfMRI_baselines(batch, "test")
             return (subj, output.detach().cpu())
-        else:
-            subj, logits, target = self._compute_logits(batch)
-            output = torch.stack([logits.squeeze(), target.squeeze()], dim=1)
-            return (subj, output)
+
 
     def test_epoch_end(self, outputs):
         subj_test = [] 
@@ -1103,6 +1536,12 @@ class LitClassifier(pl.LightningModule):
                    help="run identifier used to name prediction output folder")
 
         group.add_argument("--loss_type", type=str, default="mse", help="which loss to use. You can use reconstructive-contrastive loss with 'rc'")
+        group.add_argument("--within_subj_margin", type=float, default=0.34,
+                   help="lambda in RC loss (weight for reconstruction term)")
+        group.add_argument("--across_subj_margin", type=float, default=0.66,
+                   help="(1-lambda) in RC loss (weight for contrast term)")
+        
+        
         group.add_argument("--optimizer", type=str, default="AdamW", help="which optimizer to use [AdamW, SGD]")
         group.add_argument("--use_scheduler", action='store_true', help="whether to use scheduler")
         group.set_defaults(use_scheduler=False)
@@ -1153,5 +1592,30 @@ class LitClassifier(pl.LightningModule):
         group.add_argument("--teacher_forcing_ratio", type=float, default=0.0,
                    help="probability to use ground-truth frame at each AR step")
         group.add_argument("--tf_schedule", type=str, default="linear", choices=["constant","linear","cosine","exp"])
+
+        group.add_argument("--ctx_update", type=str, default="sliding",
+                   choices=["sliding", "growing"],
+                   help="how to update ctx during rfMRI_next rollout")
+
+        #residual learning (rfMRI_next)
+        group.add_argument("--use_residual_branch", action="store_true",
+                           help="If set, model predicts residual over a baseline (persist/ctxmean) for rfMRI_next")
+        group.set_defaults(use_residual_branch=False)
+        
+        group.add_argument("--residual_base", type=str, default="persist",
+                           choices=["persist", "ctxmean"],
+                           help="baseline type for residual learning")
+        
+        group.add_argument("--residual_l2", type=float, default=0.0,
+                           help="optional L2 penalty on residual (0 disables)")
+
+        #metric
+        group.add_argument("--use_fc_metrics", action="store_true",
+                   help="If set, use ROI-FC vector for rfMRI_next corrmat/top1/KS metrics")
+        group.set_defaults(use_fc_metrics=False)
+        
+        group.add_argument("--roi_atlas_pt", type=str, default=None,
+                   help="Path to ROI atlas tensor saved by torch.save, shape [96,96,96], int labels (0 background)")
+
 
         return parser
